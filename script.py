@@ -73,11 +73,14 @@ CONFIG = {
     "CLIENT_ID"       : "HV4ID10C9I-100",
     "SECRET_KEY"      : "A81349Q03B",
     "REDIRECT_URI"    : "https://trade.fyers.in/api-login/redirect-uri/index.html",
-    "ACCESS_TOKEN"    : "",                          # filled after login
+    "ACCESS_TOKEN"    : "",                          # filled after auto-login
+    "FYERS_USER_ID"   : "FAI74867",                 # your Fyers user ID
+    "FYERS_PASSWORD"  : "6905",                     # your Fyers password
+    "TOTP_SECRET"     : "LS2YJRTOOWWRUBSSV6AL4VXXR70ZN2NN",  # TOTP secret key
 
     # ── Capital & Sizing ───────────────────────────────────────────────────
-    "CAPITAL"         : 50_000,      # ₹ your total capital
-    "DAILY_LOSS_LIMIT": 1_000,       # ₹ max loss per day before halt
+    "CAPITAL"         : 50_000,      # ₹ fallback capital if Fyers balance fetch fails
+    "DAILY_LOSS_PCT"  : 2.0,         # Daily loss limit = 2% of capital (AUTO calculated)
     "RISK_RATIO"      : 10,          # divisor: target_units = DLL / risk_ratio
     "LOT_SIZE"        : 65,          # NIFTY 1 lot = 65 qty (update if NSE changes)
 
@@ -91,7 +94,7 @@ CONFIG = {
 
     # ── Execution ──────────────────────────────────────────────────────────
     "NIFTY_INDEX"     : "NSE:NIFTY50-INDEX",
-    "TIMEFRAME"       : "5",         # minutes for live; backtest uses daily
+    "TIMEFRAME"       : "15",        # 15-minute candles for signal generation
     "PRE_EXPIRY_EXIT_TIME": "15:20", # HH:MM IST — close before expiry
     "MARKET_OPEN"     : "09:15",
     "MARKET_CLOSE"    : "15:30",
@@ -214,21 +217,49 @@ def compute_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 # ░░░░░░░░░░░░░░░░░░  SECTION 2 — POSITION SIZING  ░░░░░░░░░░░░░░░░░░░░░░░░░
 # ─────────────────────────────────────────────────────────────────────────────
 
-def calc_lots(capital: float, daily_loss_limit: float,
-              risk_ratio: float, lot_size: int) -> tuple[int, int]:
+def calc_daily_loss_limit(capital: float, pct: float = 2.0) -> float:
+    """Daily loss limit = 2% of capital. e.g. 50000 x 2% = 1000"""
+    return round(capital * pct / 100, 2)
+
+
+def calc_lots(capital: float, daily_loss_pct: float,
+              risk_ratio: float, lot_size: int) -> tuple:
     """
-    Returns (lots, qty).
+    Returns (lots, qty, daily_loss_limit).
 
     Rule:
-      target_units = daily_loss_limit / risk_ratio      (e.g. 1000/10 = 100)
-      lots         = floor(target_units / lot_size)     (e.g. floor(100/65) = 1)
-      lots         = max(1, lots)                        minimum 1 lot
-      qty          = lots * lot_size                    (e.g. 1 * 65 = 65)
+      daily_loss_limit = capital x 2%          (e.g. 50000 x 2% = 1000)
+      target_units     = DLL / risk_ratio      (e.g. 1000 / 10  = 100)
+      lots             = floor(target / lot)   (e.g. floor(100/65) = 1)
+      lots             = max(1, lots)           minimum 1 lot always
+      qty              = lots * lot_size        (e.g. 1 * 65 = 65)
     """
-    target_units = daily_loss_limit / risk_ratio
-    lots = max(1, math.floor(target_units / lot_size))
-    qty  = lots * lot_size
-    return lots, qty
+    dll          = calc_daily_loss_limit(capital, daily_loss_pct)
+    target_units = dll / risk_ratio
+    lots         = max(1, math.floor(target_units / lot_size))
+    qty          = lots * lot_size
+    return lots, qty, dll
+
+
+def get_capital_from_fyers(fyers_client) -> float:
+    """
+    Fetch available cash balance from Fyers account.
+    Returns total capital or None on failure.
+    """
+    try:
+        resp = fyers_client.funds()
+        if resp.get("s") == "ok":
+            fund_data = resp.get("fund_limit", [])
+            for item in fund_data:
+                if item.get("title") in ("Total Balance", "Net  Balance", "Net Balance"):
+                    capital = float(item.get("equityAmount", 0))
+                    log.info(f"Fyers balance fetched: {capital}")
+                    return capital
+        log.warning(f"Could not parse Fyers funds: {resp}")
+        return None
+    except Exception as e:
+        log.error(f"Fyers funds fetch failed: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,14 +309,35 @@ def is_expiry_day(ref_date: date, expiries: list[date]) -> bool:
 
 def option_symbol_fyers(expiry: date, strike: int, opt_type: str) -> str:
     """
-    Build Fyers options symbol.
-    Format: NSE:NIFTY{YY}{MON}{DD}{STRIKE}{CE/PE}  (weekly)
-    Example: NSE:NIFTY25MAR2024200CE
+    Build Fyers weekly options symbol.
+
+    Fyers weekly format: NSE:NIFTY{YY}{M}{DD}{STRIKE}{CE/PE}
+      YY  = 2-digit year          e.g. 26
+      M   = month number          e.g. 3  (no leading zero for 1-9)
+      DD  = 2-digit day           e.g. 13
+      Example: NSE:NIFTY2631322500CE
+                         ^^ ^^ ^^^^^ ^^
+                         26  3 13  22500 CE
+
+    Fyers monthly format (last Thursday): NSE:NIFTY{YY}{MON}{STRIKE}{CE/PE}
+      Example: NSE:NIFTY26MAR22500CE
     """
-    mon = expiry.strftime("%b").upper()   # MAR
-    yy  = expiry.strftime("%y")           # 25
-    dd  = expiry.strftime("%d")           # 20
-    return f"NSE:NIFTY{yy}{mon}{dd}{strike}{opt_type}"
+    yy  = expiry.strftime("%y")       # e.g. 26
+    dd  = expiry.strftime("%d")       # e.g. 13
+    mon = expiry.strftime("%b").upper() # e.g. MAR
+
+    # Detect monthly expiry = last Thursday of month
+    # If next Thursday is in a different month → this is monthly expiry
+    next_thu = expiry + __import__('datetime').timedelta(days=7)
+    is_monthly = next_thu.month != expiry.month
+
+    if is_monthly:
+        # Monthly format: NSE:NIFTYYYMONSTRIKETYPE
+        return f"NSE:NIFTY{yy}{mon}{strike}{opt_type}"
+    else:
+        # Weekly format: NSE:NIFTYYYMDDSTRIKETYPE (M = single digit month)
+        m = str(expiry.month)         # e.g. 3  (no leading zero)
+        return f"NSE:NIFTY{yy}{m}{dd}{strike}{opt_type}"
 
 
 def atm_strike(spot: float, step: int = 50) -> int:
@@ -391,15 +443,15 @@ class BacktestEngine:
         )
         expiry_set = set(expiries)
 
-        lots, qty = calc_lots(
-            self.cfg["CAPITAL"], self.cfg["DAILY_LOSS_LIMIT"],
+        lots, qty, _dll = calc_lots(
+            self.cfg["CAPITAL"], self.cfg["DAILY_LOSS_PCT"],
             self.cfg["RISK_RATIO"], self.cfg["LOT_SIZE"]
         )
         log.info(f"Position size: {lots} lot(s) = {qty} qty")
 
         capital        = float(self.cfg["CAPITAL"])
         daily_pnl      = 0.0
-        daily_loss_lim = float(self.cfg["DAILY_LOSS_LIMIT"])
+        daily_loss_lim = calc_daily_loss_limit(self.cfg["CAPITAL"], self.cfg["DAILY_LOSS_PCT"])
         position       = None   # dict with trade details
         equity         = capital
 
@@ -604,38 +656,61 @@ class PaperTradingEngine:
     """
 
     def __init__(self, cfg: dict, fyers_client=None):
-        self.cfg    = cfg
-        self.fyers  = fyers_client
-        self.capital     = float(cfg["CAPITAL"])
+        self.cfg         = cfg
+        self.fyers       = fyers_client
         self.daily_pnl   = 0.0
         self.position    = None
         self.trade_log   = []
-        self.price_buf   = []  # rolling OHLCV buffer for indicators
-        self.last_signal = None
+        self.price_buf      = []
+        self.last_signal    = None
+        self.last_candle_ts = None   # track last processed 15-min candle
         self.today_date  = date.today()
 
-        lots, qty = calc_lots(cfg["CAPITAL"], cfg["DAILY_LOSS_LIMIT"],
-                              cfg["RISK_RATIO"], cfg["LOT_SIZE"])
-        self.lots = lots
-        self.qty  = qty
+        # Auto-fetch capital from Fyers; fallback to CONFIG value
+        self.capital = self._fetch_capital()
+        self._recalc_sizing()
 
-        log.info(f"{CYAN}[PAPER] Engine started | Lots={lots} Qty={qty}{RESET}")
+        log.info(f"{CYAN}[PAPER] Engine started | Lots={self.lots} Qty={self.qty}{RESET}")
         self._print_sizing()
 
+    def _fetch_capital(self) -> float:
+        """Fetch real account balance from Fyers. Fallback to CONFIG capital."""
+        if self.fyers:
+            cap = get_capital_from_fyers(self.fyers)
+            if cap and cap > 0:
+                return cap
+        log.warning(f"Using fallback capital: {self.cfg['CAPITAL']}")
+        return float(self.cfg["CAPITAL"])
+
+    def _recalc_sizing(self):
+        """
+        Recalculate lot size based on CURRENT capital every day.
+        Daily Loss Limit = 2% of capital (auto, never fixed).
+        """
+        lots, qty, dll = calc_lots(
+            self.capital,
+            self.cfg["DAILY_LOSS_PCT"],
+            self.cfg["RISK_RATIO"],
+            self.cfg["LOT_SIZE"]
+        )
+        self.lots             = lots
+        self.qty              = qty
+        self.daily_loss_limit = dll
+
     def _print_sizing(self):
-        lots, qty = self.lots, self.qty
-        print(f"\n{'─'*45}")
-        print(f"  PAPER TRADING MODE")
-        print(f"  Capital        : ₹{self.capital:,.0f}")
-        print(f"  Daily Loss Lim : ₹{self.cfg['DAILY_LOSS_LIMIT']:,.0f}")
+        print("\n" + "-"*45)
+        print("  PAPER TRADING MODE")
+        print(f"  Capital        : Rs.{self.capital:,.0f}")
+        print(f"  Daily Loss Lim : Rs.{self.daily_loss_limit:,.0f}  (2% of capital)")
         print(f"  Risk Ratio     : {self.cfg['RISK_RATIO']}")
-        print(f"  Target Units   : {self.cfg['DAILY_LOSS_LIMIT']/self.cfg['RISK_RATIO']:.0f}")
-        print(f"  Lots           : {lots}")
-        print(f"  Qty            : {qty}")
-        print(f"{'─'*45}\n")
+        print(f"  Target Units   : {self.daily_loss_limit / self.cfg['RISK_RATIO']:.0f}")
+        print(f"  Lots           : {self.lots}")
+        print(f"  Qty            : {self.qty}")
+        print("-"*45 + "\n")
+
 
     def get_ltp(self) -> float | None:
-        """Fetch latest NIFTY 50 index price from Fyers."""
+        """Fetch latest NIFTY 50 index LTP from Fyers."""
         if not self.fyers:
             return None
         try:
@@ -645,37 +720,92 @@ class PaperTradingEngine:
             log.error(f"LTP fetch failed: {e}")
             return None
 
+    def fetch_15min_candles(self, lookback_days: int = 5) -> pd.DataFrame | None:
+        """
+        Fetch last N days of 15-minute OHLCV candles for NIFTY 50 from Fyers.
+        Returns DataFrame with columns: open, high, low, close, volume
+        indexed by datetime (IST).
+        """
+        if not self.fyers:
+            return None
+        try:
+            today     = date.today()
+            from_date = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            to_date   = today.strftime("%Y-%m-%d")
+            params = {
+                "symbol"     : self.cfg["NIFTY_INDEX"],
+                "resolution" : "15",        # 15-minute candles
+                "date_format": "1",         # epoch timestamps
+                "range_from" : from_date,
+                "range_to"   : to_date,
+                "cont_flag"  : "1"
+            }
+            resp = self.fyers.history(params)
+            if resp.get("s") != "ok":
+                log.error(f"Candle fetch failed: {resp}")
+                return None
+
+            candles = resp.get("candles", [])
+            if not candles:
+                return None
+
+            df = pd.DataFrame(candles,
+                              columns=["timestamp","open","high","low","close","volume"])
+            df["date"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)                           .dt.tz_convert("Asia/Kolkata")
+            df.set_index("date", inplace=True)
+            df.drop(columns=["timestamp"], inplace=True)
+            df.sort_index(inplace=True)
+            log.info(f"Fetched {len(df)} x 15-min candles up to {df.index[-1]}")
+            return df
+
+        except Exception as e:
+            log.error(f"fetch_15min_candles error: {e}")
+            return None
+
     def _reset_daily(self):
-        self.daily_pnl = 0.0
-        self.today_date = date.today()
-        log.info("[PAPER] New day — daily P&L reset")
+        """Reset daily P&L and recalculate lot size from fresh capital."""
+        self.daily_pnl      = 0.0
+        self.today_date     = date.today()
+        self.last_candle_ts = None   # force fresh candle fetch
+        self.capital        = self._fetch_capital()
+        self._recalc_sizing()
+        log.info(f"[PAPER] New day | Capital=Rs.{self.capital:,.0f} | "
+                 f"DLL=Rs.{self.daily_loss_limit:,.0f} | Lots={self.lots} Qty={self.qty}")
 
-    def _update_buffer(self, price: float):
-        """Maintain a rolling price buffer for signal computation."""
-        ts = datetime.now(IST)
-        if self.price_buf:
-            last = self.price_buf[-1]
-            # Simple OHLCV bar: treat each tick as a close
-            self.price_buf.append({
-                "date": ts, "open": price, "high": price,
-                "low": price, "close": price, "volume": 0
-            })
-        else:
-            self.price_buf.append({
-                "date": ts, "open": price, "high": price,
-                "low": price, "close": price, "volume": 0
-            })
-        # Keep last 200 bars for indicator warmup
-        if len(self.price_buf) > 300:
-            self.price_buf = self.price_buf[-300:]
+    def _get_signals(self) -> tuple[bool, bool, float | None]:
+        """
+        Fetch latest 15-min candles from Fyers, compute CE+ZLSMA signals.
+        Only fires signal on a NEW (just closed) candle.
+        Returns (buy_signal, sell_signal, current_spot)
+        """
+        df = self.fetch_15min_candles(lookback_days=10)
+        if df is None or len(df) < self.cfg["ZLSMA_LEN"] + 5:
+            log.warning("Not enough candles for signal computation")
+            return False, False, None
 
-    def _get_signals(self) -> tuple[bool, bool]:
-        """Compute CE+ZLSMA signals from buffer. Returns (buy, sell)."""
-        if len(self.price_buf) < self.cfg["ZLSMA_LEN"] + 10:
-            return False, False
-        df = pd.DataFrame(self.price_buf).set_index("date")
+        # Get current spot from latest candle close
+        spot = float(df["close"].iloc[-1])
+
+        # Only act on a newly closed candle (last candle timestamp changed)
+        latest_ts = df.index[-1]
+        if latest_ts == self.last_candle_ts:
+            # Same candle still open — no new signal
+            return False, False, spot
+
+        # New candle closed — compute signals
+        self.last_candle_ts = latest_ts
         df = compute_signals(df, self.cfg)
-        return bool(df["buy_signal"].iloc[-1]), bool(df["sell_signal"].iloc[-1])
+
+        # Signal is on the LAST COMPLETED candle (index -1 = just closed)
+        buy_sig  = bool(df["buy_signal"].iloc[-1])
+        sell_sig = bool(df["sell_signal"].iloc[-1])
+
+        if buy_sig:
+            log.info(f"[SIGNAL] BUY on 15-min candle closed at {latest_ts} | NIFTY={spot}")
+        if sell_sig:
+            log.info(f"[SIGNAL] SELL on 15-min candle closed at {latest_ts} | NIFTY={spot}")
+
+        return buy_sig, sell_sig, spot
 
     def _entry(self, signal: str, spot: float):
         today = date.today()
@@ -772,20 +902,22 @@ class PaperTradingEngine:
             return
 
         # Daily loss halt
-        if self.daily_pnl <= -float(self.cfg["DAILY_LOSS_LIMIT"]):
+        if self.daily_pnl <= -self.daily_loss_limit:
             if self.position:
                 spot = self.get_ltp() or self.position["spot_entry"]
                 self._exit(spot, "Daily loss limit hit")
             return
 
-        spot = self.get_ltp()
+        # Get signals from latest CLOSED 15-min candle
+        buy_sig, sell_sig, spot = self._get_signals()
+
+        # If no candle data, fall back to LTP for SL/TP checks only
+        if spot is None:
+            spot = self.get_ltp()
         if spot is None:
             return
 
-        self._update_buffer(spot)
-        buy_sig, sell_sig = self._get_signals()
-
-        # Check SL/TP
+        # Check SL/TP on current position using live spot
         if self.position:
             p = self.position
             hit_sl = (p["signal"] == "BUY"  and spot <= p["sl_spot"]) or \
@@ -799,7 +931,7 @@ class PaperTradingEngine:
                 self._exit(spot, "Take Profit")
                 return
 
-        # New signal
+        # New signal fires only on freshly closed 15-min candle
         if buy_sig and self.last_signal != "BUY":
             if self.position:
                 self._exit(spot, "Signal reverse")
@@ -810,7 +942,7 @@ class PaperTradingEngine:
             self._entry("SELL", spot)
 
     def run(self, interval_seconds: int = 60):
-        log.info(f"[PAPER] Starting live paper trading loop (interval={interval_seconds}s)")
+        log.info(f"[PAPER] Starting — checking for new 15-min candle every {interval_seconds}s")
         print(f"\n{CYAN}Paper trading active. Press Ctrl+C to stop.{RESET}")
         try:
             while True:
@@ -910,45 +1042,111 @@ class LiveTradingEngine(PaperTradingEngine):
 
 def fyers_login(cfg: dict):
     """
-    Interactive Fyers OAuth login.
-    Prints auth URL → user pastes redirect URL → returns fyers client.
+    AUTO login to Fyers using User ID + Password + TOTP.
+    No browser needed — runs fully automatically on cloud server.
     """
     if not FYERS_AVAILABLE:
-        log.error("fyers-apiv3 not installed. Run: pip install fyers-apiv3")
+        log.error("fyers-apiv3 not installed.")
         return None
 
     import urllib.parse
+    import requests
+    import pyotp
 
-    session = fyersModel.SessionModel(
-        client_id    = cfg["CLIENT_ID"],
-        secret_key   = cfg["SECRET_KEY"],
-        redirect_uri = cfg["REDIRECT_URI"],
-        response_type= "code",
-        grant_type   = "authorization_code"
-    )
-    auth_url = session.generate_authcode()
-    print(f"\n{YELLOW}Open this URL in your browser and log in:{RESET}")
-    print(auth_url)
-    redirect_url = input("\nPaste the full redirect URL here: ").strip()
+    try:
+        log.info("Starting auto Fyers login...")
 
-    parsed = urllib.parse.urlparse(redirect_url)
-    auth_code = urllib.parse.parse_qs(parsed.query).get("auth_code", [None])[0]
-    if not auth_code:
-        log.error("Could not extract auth_code from URL.")
+        # Step 1 — Generate TOTP
+        totp = pyotp.TOTP(cfg["TOTP_SECRET"]).now()
+        log.info(f"TOTP generated: {totp}")
+
+        # Step 2 — Send login request to Fyers API
+        headers = {"Content-Type": "application/json"}
+
+        # Get auth code via Fyers API v3 login
+        session = fyersModel.SessionModel(
+            client_id     = cfg["CLIENT_ID"],
+            secret_key    = cfg["SECRET_KEY"],
+            redirect_uri  = cfg["REDIRECT_URI"],
+            response_type = "code",
+            grant_type    = "authorization_code"
+        )
+        auth_url = session.generate_authcode()
+
+        # Step 3 — Auto login using requests
+        login_url = "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2"
+        resp = requests.post(login_url, json={
+            "fy_id": cfg["FYERS_USER_ID"],
+            "app_id": "2"
+        }, headers=headers)
+        log.info(f"Login step 1: {resp.json()}")
+        request_key = resp.json().get("request_key")
+
+        # Step 4 — Verify TOTP
+        verify_url = "https://api-t2.fyers.in/vagator/v2/verify_otp"
+        resp2 = requests.post(verify_url, json={
+            "request_key": request_key,
+            "otp": totp
+        }, headers=headers)
+        log.info(f"TOTP verify: {resp2.json()}")
+        request_key2 = resp2.json().get("request_key")
+
+        # Step 5 — Verify PIN/Password
+        verify_pin_url = "https://api-t2.fyers.in/vagator/v2/verify_pin_v2"
+        resp3 = requests.post(verify_pin_url, json={
+            "request_key": request_key2,
+            "identity_type": "pin",
+            "identifier": cfg["FYERS_PASSWORD"]
+        }, headers=headers)
+        log.info(f"PIN verify: {resp3.json()}")
+        access_token_step = resp3.json().get("data", {}).get("access_token")
+
+        # Step 6 — Get auth code
+        token_url = "https://api-t1.fyers.in/api/v3/token"
+        resp4 = requests.post(token_url, json={
+            "fyers_id"    : cfg["FYERS_USER_ID"],
+            "app_id"      : cfg["CLIENT_ID"].split("-")[0],
+            "redirect_uri": cfg["REDIRECT_URI"],
+            "appType"     : "100",
+            "code_challenge": "",
+            "state"       : "None",
+            "scope"       : "",
+            "nonce"       : "",
+            "response_type": "code",
+            "create_cookie": True
+        }, headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token_step}"
+        })
+        log.info(f"Auth code resp: {resp4.json()}")
+        auth_code = resp4.json().get("Url", "")
+        if "auth_code=" in auth_code:
+            auth_code = urllib.parse.parse_qs(
+                urllib.parse.urlparse(auth_code).query
+            ).get("auth_code", [None])[0]
+        else:
+            log.error(f"Could not get auth code: {resp4.json()}")
+            return None
+
+        # Step 7 — Generate access token
+        session.set_token(auth_code)
+        token_resp = session.generate_token()
+        access_token = token_resp.get("access_token")
+        if not access_token:
+            log.error(f"Token generation failed: {token_resp}")
+            return None
+
+        fyers = fyersModel.FyersModel(
+            client_id = cfg["CLIENT_ID"],
+            token     = access_token,
+            log_path  = "."
+        )
+        log.info(f"{GREEN}Auto Fyers login successful!{RESET}")
+        return fyers
+
+    except Exception as e:
+        log.error(f"Auto login failed: {e}")
         return None
-
-    session.set_token(auth_code)
-    resp = session.generate_token()
-    access_token = resp.get("access_token")
-    if not access_token:
-        log.error(f"Token generation failed: {resp}")
-        return None
-
-    fyers = fyersModel.FyersModel(
-        client_id    = cfg["CLIENT_ID"],
-        token        = access_token,
-        log_path     = "."
-    )
     log.info(f"{GREEN}Fyers login successful!{RESET}")
     return fyers
 
@@ -980,12 +1178,13 @@ def main():
 """)
 
     # ── Validate sizing ───────────────────────────────────────────────────
-    lots, qty = calc_lots(
-        CONFIG["CAPITAL"], CONFIG["DAILY_LOSS_LIMIT"],
+    lots, qty, _dll = calc_lots(
+        CONFIG["CAPITAL"], calc_daily_loss_limit(CONFIG["CAPITAL"], CONFIG["DAILY_LOSS_PCT"]),
         CONFIG["RISK_RATIO"], CONFIG["LOT_SIZE"]
     )
-    print(f"  Lot sizing: target={CONFIG['DAILY_LOSS_LIMIT']/CONFIG['RISK_RATIO']:.0f} units "
-          f"→ {lots} lot(s) = {qty} qty  (1 lot = {CONFIG['LOT_SIZE']} units)")
+    dll = calc_daily_loss_limit(CONFIG["CAPITAL"], CONFIG["DAILY_LOSS_PCT"])
+    print(f"  Daily Loss Limit: Rs.{dll:,.0f} (2% of Rs.{CONFIG['CAPITAL']:,.0f})")
+    print(f"  Lot sizing: target={dll/CONFIG['RISK_RATIO']:.0f} units -> {lots} lot(s) = {qty} qty  (1 lot = {CONFIG['LOT_SIZE']} units)")
     print()
 
     # ── MODE: BACKTEST ────────────────────────────────────────────────────
@@ -1010,7 +1209,7 @@ def main():
 {RED}⚠️  LIVE TRADING MODE — REAL MONEY AT RISK{RESET}
   - Ensure you have completed 3–6 months of paper trading
   - Backtest results should be verified
-  - Daily loss limit: ₹{CONFIG['DAILY_LOSS_LIMIT']:,}
+  - Daily loss limit: ₹{calc_daily_loss_limit(CONFIG['CAPITAL'], CONFIG['DAILY_LOSS_PCT']):,}
   - Capital: ₹{CONFIG['CAPITAL']:,}
 """)
         confirm = input("  Type  YES  to proceed with live trading: ").strip()
