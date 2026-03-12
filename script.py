@@ -76,7 +76,7 @@ CONFIG = {
     "ACCESS_TOKEN"    : "",                          # filled after auto-login
     "FYERS_USER_ID"   : "FAI74867",                 # your Fyers user ID
     "FYERS_PASSWORD"  : "6905",                     # your Fyers password
-    "TOTP_SECRET"     : "LS2YJRTOOWWRUBSSV6AL4VXXR70ZN2NN",  # TOTP secret key
+    "TOTP_SECRET"     : "REQRGPQCNJ2M2N7P43GRDGUZVBLWB6GM",  # TOTP secret key
 
     # ── Capital & Sizing ───────────────────────────────────────────────────
     "CAPITAL"         : 50_000,      # ₹ fallback capital if Fyers balance fetch fails
