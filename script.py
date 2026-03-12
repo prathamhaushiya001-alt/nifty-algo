@@ -1060,10 +1060,16 @@ def fyers_login(cfg: dict):
         totp = pyotp.TOTP(cfg["TOTP_SECRET"]).now()
         log.info(f"TOTP generated: {totp}")
 
-        # Step 2 — Send login request to Fyers API
+        # Step 2 — Setup session and endpoints
         headers = {"Content-Type": "application/json"}
+        BASE_URL  = "https://api-t2.fyers.in/vagator/v2"
+        BASE_URL2 = "https://api-t1.fyers.in/api/v3"
+        URL_SEND_LOGIN_OTP   = BASE_URL  + "/send_login_otp_v3"
+        URL_VERIFY_TOTP      = BASE_URL  + "/verify_otp"
+        URL_VERIFY_PIN       = BASE_URL  + "/verify_pin_v2"
+        URL_TOKEN            = BASE_URL2 + "/token"
+        URL_VALIDATE_AUTH    = BASE_URL2 + "/validate-authcode"
 
-        # Get auth code via Fyers API v3 login
         session = fyersModel.SessionModel(
             client_id     = cfg["CLIENT_ID"],
             secret_key    = cfg["SECRET_KEY"],
@@ -1071,62 +1077,66 @@ def fyers_login(cfg: dict):
             response_type = "code",
             grant_type    = "authorization_code"
         )
-        auth_url = session.generate_authcode()
 
-        # Step 3 — Auto login using requests
-        login_url = "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2"
-        resp = requests.post(login_url, json={
-            "fy_id": cfg["FYERS_USER_ID"],
+        # Step 3 — Send login OTP (v3 endpoint)
+        resp = requests.post(URL_SEND_LOGIN_OTP, json={
+            "fy_id" : cfg["FYERS_USER_ID"],
             "app_id": "2"
-        }, headers=headers)
+        }, headers=headers, timeout=10)
         log.info(f"Login step 1: {resp.json()}")
-        request_key = resp.json().get("request_key")
+        data1 = resp.json()
+        if data1.get("s") != "ok":
+            log.error(f"Login OTP failed: {data1}")
+            return None
+        request_key = data1.get("request_key")
 
         # Step 4 — Verify TOTP
-        verify_url = "https://api-t2.fyers.in/vagator/v2/verify_otp"
-        resp2 = requests.post(verify_url, json={
+        resp2 = requests.post(URL_VERIFY_TOTP, json={
             "request_key": request_key,
-            "otp": totp
-        }, headers=headers)
+            "otp"        : totp
+        }, headers=headers, timeout=10)
         log.info(f"TOTP verify: {resp2.json()}")
+        if resp2.json().get("s") != "ok":
+            log.error(f"TOTP verify failed: {resp2.json()}")
+            return None
         request_key2 = resp2.json().get("request_key")
 
-        # Step 5 — Verify PIN/Password
-        verify_pin_url = "https://api-t2.fyers.in/vagator/v2/verify_pin_v2"
-        resp3 = requests.post(verify_pin_url, json={
-            "request_key": request_key2,
+        # Step 5 — Verify PIN
+        resp3 = requests.post(URL_VERIFY_PIN, json={
+            "request_key"  : request_key2,
             "identity_type": "pin",
-            "identifier": cfg["FYERS_PASSWORD"]
-        }, headers=headers)
+            "identifier"   : str(cfg["FYERS_PASSWORD"])
+        }, headers=headers, timeout=10)
         log.info(f"PIN verify: {resp3.json()}")
+        if resp3.json().get("s") != "ok":
+            log.error(f"PIN verify failed: {resp3.json()}")
+            return None
         access_token_step = resp3.json().get("data", {}).get("access_token")
 
         # Step 6 — Get auth code
-        token_url = "https://api-t1.fyers.in/api/v3/token"
-        resp4 = requests.post(token_url, json={
-            "fyers_id"    : cfg["FYERS_USER_ID"],
-            "app_id"      : cfg["CLIENT_ID"].split("-")[0],
-            "redirect_uri": cfg["REDIRECT_URI"],
-            "appType"     : "100",
+        resp4 = requests.post(f"{BASE_URL2}/token", json={
+            "fyers_id"      : cfg["FYERS_USER_ID"],
+            "app_id"        : cfg["CLIENT_ID"].split("-")[0],
+            "redirect_uri"  : cfg["REDIRECT_URI"],
+            "appType"       : "100",
             "code_challenge": "",
-            "state"       : "None",
-            "scope"       : "",
-            "nonce"       : "",
-            "response_type": "code",
-            "create_cookie": True
+            "state"         : "sample",
+            "scope"         : "",
+            "nonce"         : "",
+            "response_type" : "code",
+            "create_cookie" : True
         }, headers={
-            "Content-Type": "application/json",
+            "Content-Type" : "application/json",
             "Authorization": f"Bearer {access_token_step}"
         })
         log.info(f"Auth code resp: {resp4.json()}")
-        auth_code = resp4.json().get("Url", "")
-        if "auth_code=" in auth_code:
-            auth_code = urllib.parse.parse_qs(
-                urllib.parse.urlparse(auth_code).query
-            ).get("auth_code", [None])[0]
-        else:
+        auth_code_url = resp4.json().get("Url", "")
+        if "auth_code=" not in auth_code_url:
             log.error(f"Could not get auth code: {resp4.json()}")
             return None
+        auth_code = urllib.parse.parse_qs(
+            urllib.parse.urlparse(auth_code_url).query
+        ).get("auth_code", [None])[0]
 
         # Step 7 — Generate access token
         session.set_token(auth_code)
@@ -1179,7 +1189,7 @@ def main():
 
     # ── Validate sizing ───────────────────────────────────────────────────
     lots, qty, _dll = calc_lots(
-        CONFIG["CAPITAL"], calc_daily_loss_limit(CONFIG["CAPITAL"], CONFIG["DAILY_LOSS_PCT"]),
+        CONFIG["CAPITAL"], CONFIG["DAILY_LOSS_PCT"],
         CONFIG["RISK_RATIO"], CONFIG["LOT_SIZE"]
     )
     dll = calc_daily_loss_limit(CONFIG["CAPITAL"], CONFIG["DAILY_LOSS_PCT"])
