@@ -722,44 +722,53 @@ class PaperTradingEngine:
 
     def fetch_15min_candles(self, lookback_days: int = 5) -> pd.DataFrame | None:
         """
-        Fetch last N days of 15-minute OHLCV candles for NIFTY 50 from Fyers.
-        Returns DataFrame with columns: open, high, low, close, volume
-        indexed by datetime (IST).
+        Fetch 15-min candles. Tries Fyers first, falls back to Yahoo Finance.
         """
-        if not self.fyers:
-            return None
+        # Try Fyers first if connected
+        if self.fyers:
+            try:
+                today     = date.today()
+                from_date = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+                to_date   = today.strftime("%Y-%m-%d")
+                params = {
+                    "symbol"     : self.cfg["NIFTY_INDEX"],
+                    "resolution" : "15",
+                    "date_format": "1",
+                    "range_from" : from_date,
+                    "range_to"   : to_date,
+                    "cont_flag"  : "1"
+                }
+                resp = self.fyers.history(params)
+                if resp.get("s") == "ok":
+                    candles = resp.get("candles", [])
+                    if candles:
+                        df = pd.DataFrame(candles,
+                                          columns=["timestamp","open","high","low","close","volume"])
+                        df["date"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+                        df.set_index("date", inplace=True)
+                        df.drop(columns=["timestamp"], inplace=True)
+                        df.sort_index(inplace=True)
+                        log.info(f"[Fyers] Fetched {len(df)} x 15-min candles")
+                        return df
+            except Exception as e:
+                log.error(f"Fyers candle fetch error: {e}")
+
+        # Fallback to Yahoo Finance
         try:
-            today     = date.today()
-            from_date = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-            to_date   = today.strftime("%Y-%m-%d")
-            params = {
-                "symbol"     : self.cfg["NIFTY_INDEX"],
-                "resolution" : "15",        # 15-minute candles
-                "date_format": "1",         # epoch timestamps
-                "range_from" : from_date,
-                "range_to"   : to_date,
-                "cont_flag"  : "1"
-            }
-            resp = self.fyers.history(params)
-            if resp.get("s") != "ok":
-                log.error(f"Candle fetch failed: {resp}")
+            import yfinance as yf
+            df = yf.Ticker("^NSEI").history(period=f"{lookback_days+2}d", interval="15m")
+            if df is None or len(df) == 0:
+                log.error("Yahoo Finance returned no data")
                 return None
-
-            candles = resp.get("candles", [])
-            if not candles:
-                return None
-
-            df = pd.DataFrame(candles,
-                              columns=["timestamp","open","high","low","close","volume"])
-            df["date"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)                           .dt.tz_convert("Asia/Kolkata")
-            df.set_index("date", inplace=True)
-            df.drop(columns=["timestamp"], inplace=True)
+            df.index = df.index.tz_convert("Asia/Kolkata")
+            df.columns = [c.lower() for c in df.columns]
+            df = df[["open","high","low","close","volume"]]
             df.sort_index(inplace=True)
-            log.info(f"Fetched {len(df)} x 15-min candles up to {df.index[-1]}")
+            df = df.between_time("09:15", "15:30")
+            log.info(f"[Yahoo] Fetched {len(df)} x 15-min candles up to {df.index[-1]}")
             return df
-
         except Exception as e:
-            log.error(f"fetch_15min_candles error: {e}")
+            log.error(f"Yahoo Finance fallback error: {e}")
             return None
 
     def _reset_daily(self):
@@ -1064,7 +1073,7 @@ def fyers_login(cfg: dict):
         headers = {"Content-Type": "application/json"}
         BASE_URL  = "https://api-t2.fyers.in/vagator/v2"
         BASE_URL2 = "https://api-t1.fyers.in/api/v3"
-        URL_SEND_LOGIN_OTP   = BASE_URL  + "/send_login_otp_v3"
+        URL_SEND_LOGIN_OTP   = BASE_URL  + "/send_login_otp_v2"
         URL_VERIFY_TOTP      = BASE_URL  + "/verify_otp"
         URL_VERIFY_PIN       = BASE_URL  + "/verify_pin_v2"
         URL_TOKEN            = BASE_URL2 + "/token"
