@@ -805,9 +805,9 @@ class PaperTradingEngine:
         self.last_candle_ts = latest_ts
         df = compute_signals(df, self.cfg)
 
-        # Signal is on the LAST COMPLETED candle (index -1 = just closed)
-        buy_sig  = bool(df["buy_signal"].iloc[-1])
-        sell_sig = bool(df["sell_signal"].iloc[-1])
+        # Signal is on the LAST COMPLETED candle (index -2, since -1 may still be open)
+        buy_sig  = bool(df["buy_signal"].iloc[-2])
+        sell_sig = bool(df["sell_signal"].iloc[-2])
 
         if buy_sig:
             log.info(f"[SIGNAL] BUY on 15-min candle closed at {latest_ts} | NIFTY={spot}")
@@ -1051,8 +1051,8 @@ class LiveTradingEngine(PaperTradingEngine):
 
 def fyers_login(cfg: dict):
     """
-    AUTO login to Fyers using User ID + Password + TOTP.
-    No browser needed — runs fully automatically on cloud server.
+    FIXED AUTO login — base64 encoding for fy_id and PIN.
+    Resolves error -1025 invalid request. (Fixed 17-Mar-2026)
     """
     if not FYERS_AVAILABLE:
         log.error("fyers-apiv3 not installed.")
@@ -1061,69 +1061,67 @@ def fyers_login(cfg: dict):
     import urllib.parse
     import requests
     import pyotp
+    import base64
+    import time
+
+    def b64(s):
+        return base64.b64encode(str(s).encode("ascii")).decode("ascii")
 
     try:
-        log.info("Starting auto Fyers login...")
+        log.info("Starting FIXED auto Fyers login...")
 
-        # Step 1 — Generate TOTP
-        totp = pyotp.TOTP(cfg["TOTP_SECRET"]).now()
-        log.info(f"TOTP generated: {totp}")
-
-        # Step 2 — Setup session and endpoints
-        headers = {"Content-Type": "application/json"}
         BASE_URL  = "https://api-t2.fyers.in/vagator/v2"
         BASE_URL2 = "https://api-t1.fyers.in/api/v3"
-        URL_SEND_LOGIN_OTP   = BASE_URL  + "/send_login_otp_v2"
-        URL_VERIFY_TOTP      = BASE_URL  + "/verify_otp"
-        URL_VERIFY_PIN       = BASE_URL  + "/verify_pin_v2"
-        URL_TOKEN            = BASE_URL2 + "/token"
-        URL_VALIDATE_AUTH    = BASE_URL2 + "/validate-authcode"
+        headers   = {"Content-Type": "application/json"}
 
-        session = fyersModel.SessionModel(
-            client_id     = cfg["CLIENT_ID"],
-            secret_key    = cfg["SECRET_KEY"],
-            redirect_uri  = cfg["REDIRECT_URI"],
-            response_type = "code",
-            grant_type    = "authorization_code"
-        )
-
-        # Step 3 — Send login OTP (v3 endpoint)
-        resp = requests.post(URL_SEND_LOGIN_OTP, json={
-            "fy_id" : cfg["FYERS_USER_ID"],
+        # Step 1 — Send login OTP (base64 encode fy_id — FIXES -1025)
+        resp = requests.post(BASE_URL + "/send_login_otp_v2", json={
+            "fy_id" : b64(cfg["FYERS_USER_ID"]),
             "app_id": "2"
         }, headers=headers, timeout=10)
-        log.info(f"Login step 1: {resp.json()}")
         data1 = resp.json()
+        log.info(f"Login step 1: {data1}")
         if data1.get("s") != "ok":
             log.error(f"Login OTP failed: {data1}")
             return None
         request_key = data1.get("request_key")
 
-        # Step 4 — Verify TOTP
-        resp2 = requests.post(URL_VERIFY_TOTP, json={
+        # Step 2 — Wait if TOTP near expiry boundary
+        if int(time.time()) % 30 >= 27:
+            log.info("Waiting for fresh TOTP window...")
+            time.sleep(5)
+
+        # Step 3 — Verify TOTP
+        totp = pyotp.TOTP(cfg["TOTP_SECRET"]).now()
+        log.info(f"TOTP generated: {totp}")
+        resp2 = requests.post(BASE_URL + "/verify_otp", json={
             "request_key": request_key,
             "otp"        : totp
         }, headers=headers, timeout=10)
-        log.info(f"TOTP verify: {resp2.json()}")
-        if resp2.json().get("s") != "ok":
-            log.error(f"TOTP verify failed: {resp2.json()}")
+        data2 = resp2.json()
+        log.info(f"TOTP verify: {data2}")
+        if data2.get("s") != "ok":
+            log.error(f"TOTP verify failed: {data2}")
             return None
-        request_key2 = resp2.json().get("request_key")
+        request_key2 = data2.get("request_key")
 
-        # Step 5 — Verify PIN
-        resp3 = requests.post(URL_VERIFY_PIN, json={
+        # Step 4 — Verify PIN (base64 encode PIN — FIXES -1025)
+        ses = requests.Session()
+        resp3 = ses.post(BASE_URL + "/verify_pin_v2", json={
             "request_key"  : request_key2,
             "identity_type": "pin",
-            "identifier"   : str(cfg["FYERS_PASSWORD"])
+            "identifier"   : b64(str(cfg["FYERS_PASSWORD"]))
         }, headers=headers, timeout=10)
-        log.info(f"PIN verify: {resp3.json()}")
-        if resp3.json().get("s") != "ok":
-            log.error(f"PIN verify failed: {resp3.json()}")
+        data3 = resp3.json()
+        log.info(f"PIN verify: {data3}")
+        if data3.get("s") != "ok":
+            log.error(f"PIN verify failed: {data3}")
             return None
-        access_token_step = resp3.json().get("data", {}).get("access_token")
+        access_token_step = data3.get("data", {}).get("access_token")
 
-        # Step 6 — Get auth code
-        resp4 = requests.post(f"{BASE_URL2}/token", json={
+        # Step 5 — Get auth code
+        ses.headers.update({"Authorization": f"Bearer {access_token_step}"})
+        resp4 = ses.post(BASE_URL2 + "/token", json={
             "fyers_id"      : cfg["FYERS_USER_ID"],
             "app_id"        : cfg["CLIENT_ID"].split("-")[0],
             "redirect_uri"  : cfg["REDIRECT_URI"],
@@ -1134,20 +1132,25 @@ def fyers_login(cfg: dict):
             "nonce"         : "",
             "response_type" : "code",
             "create_cookie" : True
-        }, headers={
-            "Content-Type" : "application/json",
-            "Authorization": f"Bearer {access_token_step}"
-        })
-        log.info(f"Auth code resp: {resp4.json()}")
-        auth_code_url = resp4.json().get("Url", "")
+        }, timeout=10)
+        data4 = resp4.json()
+        log.info(f"Auth code resp: {data4}")
+        auth_code_url = data4.get("Url", "")
         if "auth_code=" not in auth_code_url:
-            log.error(f"Could not get auth code: {resp4.json()}")
+            log.error(f"Could not get auth code: {data4}")
             return None
         auth_code = urllib.parse.parse_qs(
             urllib.parse.urlparse(auth_code_url).query
         ).get("auth_code", [None])[0]
 
-        # Step 7 — Generate access token
+        # Step 6 — Generate final access token
+        session = fyersModel.SessionModel(
+            client_id     = cfg["CLIENT_ID"],
+            secret_key    = cfg["SECRET_KEY"],
+            redirect_uri  = cfg["REDIRECT_URI"],
+            response_type = "code",
+            grant_type    = "authorization_code"
+        )
         session.set_token(auth_code)
         token_resp = session.generate_token()
         access_token = token_resp.get("access_token")
@@ -1160,14 +1163,12 @@ def fyers_login(cfg: dict):
             token     = access_token,
             log_path  = "."
         )
-        log.info(f"{GREEN}Auto Fyers login successful!{RESET}")
+        log.info(f"{GREEN}Fyers login SUCCESSFUL! (-1025 error fixed){RESET}")
         return fyers
 
     except Exception as e:
         log.error(f"Auto login failed: {e}")
         return None
-    log.info(f"{GREEN}Fyers login successful!{RESET}")
-    return fyers
 
 
 # ─────────────────────────────────────────────────────────────────────────────
