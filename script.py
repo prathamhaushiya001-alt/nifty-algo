@@ -1176,6 +1176,20 @@ def fyers_login(cfg: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    # ── Single instance lock — prevent duplicate algo runs ────────────────
+    import fcntl
+    LOCK_FILE = "/tmp/nifty_algo.lock"
+    lock_fh = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fh.write(str(os.getpid()))
+        lock_fh.flush()
+    except IOError:
+        print("Another instance of algo is already running! Exiting.")
+        log.error("Duplicate instance detected — exiting.")
+        lock_fh.close()
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(
         description="CE + ZLSMA NIFTY Options Algo — Fyers"
     )
